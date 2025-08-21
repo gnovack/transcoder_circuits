@@ -83,10 +83,14 @@ cfg = LanguageModelSAERunnerConfig(
 
     # WANDB
     log_to_wandb = False,
+
+    # Comet
+    log_to_comet = True,
     
     # Misc
     use_tqdm = True,
-    device = "cuda",
+    # device = "cuda",
+    device = "mps",
     seed = 42,
     n_checkpoints = 3,
     checkpoint_path = "gpt2-small-transcoders", # change as you please
@@ -111,7 +115,8 @@ sparse_autoencoder = train_sae_on_language_model(
     dead_feature_threshold = cfg.dead_feature_threshold,
     dead_feature_window=cfg.dead_feature_window,
     use_wandb = cfg.log_to_wandb,
-    wandb_log_frequency = cfg.wandb_log_frequency
+    wandb_log_frequency = cfg.wandb_log_frequency,
+    use_comet = cfg.log_to_comet
 )
 
 # save sae to checkpoints folder

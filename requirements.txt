@@ -1,11 +1,12 @@
 matplotlib
 numpy
 plotly
-torch==2.2.0
+torch
 tqdm
-transformer_lens==1.11.0
+transformer_lens
 datasets==2.12.0
 einops==0.7.0
 setuptools==67.7.2
-wandb==0.16.0
+wandb
+comet-ml
 huggingface-hub==0.17.3

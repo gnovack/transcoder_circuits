@@ -26,7 +26,15 @@ def train_sae_on_language_model(
     dead_feature_window: int = 2000,  # how many training steps before a feature is considered dead
     use_wandb: bool = False,
     wandb_log_frequency: int = 50,
+    use_comet: bool = False,
 ):
+
+    if use_comet:
+        from comet_ml import start
+          
+        experiment = start(
+            project_name="transcoders",
+        )
 
     if feature_sampling_method is not None:
         feature_sampling_method = feature_sampling_method.lower()
@@ -56,6 +64,9 @@ def train_sae_on_language_model(
     )
     sparse_autoencoder.initialize_b_dec(activation_store)
     sparse_autoencoder.train()
+
+    if use_comet:
+        experiment.log_parameters(sparse_autoencoder.cfg.__dict__)
     
 
     if sparse_autoencoder.cfg.use_tqdm:
@@ -179,7 +190,7 @@ def train_sae_on_language_model(
             n_frac_active_tokens += batch_size
             feature_sparsity = act_freq_scores / n_frac_active_tokens
 
-            if use_wandb and ((n_training_steps + 1) % wandb_log_frequency == 0):
+            if use_comet and ((n_training_steps + 1) % wandb_log_frequency == 0):
                 # metrics for currents acts
                 l0 = (feature_acts > 0).float().sum(-1).mean()
                 current_learning_rate = optimizer.param_groups[0]["lr"]
@@ -188,7 +199,7 @@ def train_sae_on_language_model(
                 total_variance = sae_in.pow(2).sum(-1)
                 explained_variance = 1 - per_token_l2_loss/total_variance
                 
-                wandb.log(
+                experiment.log_metrics(
                     {
                         # losses
                         "losses/mse_loss": mse_loss.item(),

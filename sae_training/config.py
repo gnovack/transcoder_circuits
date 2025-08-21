@@ -105,6 +105,9 @@ class LanguageModelSAERunnerConfig(RunnerConfig):
     wandb_entity: str = None
     wandb_log_frequency: int = 10
 
+    # Comet
+    log_to_comet: bool = False
+
     # Misc
     n_checkpoints: int = 0
     checkpoint_path: str = "checkpoints"
