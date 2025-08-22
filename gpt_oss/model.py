@@ -3,8 +3,19 @@ import torch
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssMLP, GptOssDecoderLayer, GptOssModel, GptOssForCausalLM, GptOssPreTrainedModel, GptOssRMSNorm, GptOssRotaryEmbedding, GptOssAttention, GradientCheckpointingLayer
 from transformers.cache_utils import Cache
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizer
 from transformers.integrations.mxfp4 import mlp_forward
+
+from openai_harmony import (
+    Conversation,
+    DeveloperContent,
+    HarmonyEncodingName,
+    Message,
+    Role,
+    SystemContent,
+    load_harmony_encoding,
+    ReasoningEffort
+)
 
 class HookedGptOssMlp(GptOssMLP):
 
@@ -25,7 +36,7 @@ class HookedGptOssMlp(GptOssMLP):
         if self.replacement_hook:
             result = self.replacement_hook(hidden_states)
         else:
-            result, _ = mlp_forward(self, hidden_states)
+            result, router_logits = mlp_forward(self, hidden_states)
 
         if self.cache:
             self.act_cache = {
@@ -99,14 +110,27 @@ class HookedGptOssForCausalLM(GptOssForCausalLM):
         # Initialize weights and apply final processing
         self.post_init()
 
-        self.tokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")
+        self.tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")
+        self.system_tokens = None
+        self.think_tokens = None
+        self.encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
     
-    def run_with_cache(self, input_ids, names_filter=[], stop_at_layer=None):
+    def run_with_cache(self, input_ids, names_filter=[], stop_at_layer=None, return_type=None, loss_per_token=False):
         if names_filter:
             layer_idx = int(names_filter[0].split('.')[-1])
             self.model.enable_cache(layer_idx)
 
-        output = self.forward(input_ids, names_filter=names_filter, stop_at_layer=stop_at_layer)
+        if return_type == 'loss':
+            output = self.forward(input_ids, labels=input_ids, names_filter=names_filter, stop_at_layer=stop_at_layer)
+
+            if loss_per_token:
+                loss = per_token_loss_fn(output.logits, labels=input_ids, vocab_size=self.vocab_size)
+            else:
+                loss = output.loss
+            
+            output = loss
+        else:
+            output = self.forward(input_ids, names_filter=names_filter, stop_at_layer=stop_at_layer)
 
         caches = {}
         if names_filter:
@@ -133,16 +157,113 @@ class HookedGptOssForCausalLM(GptOssForCausalLM):
                        
 
     
-    def to_tokens(self, input, truncate=True, move_to_device=True):
+    def to_tokens(self, input, prompt=None, truncate=True, move_to_device=True):
 
-        tokens = self.tokenizer(
-            input,
-            return_tensors="pt",
-            padding=True,
-            truncation=truncate,
-            max_length=131_072
-        )["input_ids"]
+        # input = self.tokenizer.apply_chat_template(
+        #     [
+        #         {"role": "user", "content": input}
+        #     ],
+        #     tokenize=False
+        # )
+
+        if prompt:
+            tokens = self.render_convo(input, prompt)
+            tokens = torch.tensor(tokens)
+        else:
+            tokens = self.tokenizer(
+                input,
+                return_tensors="pt",
+                padding=True,
+                truncation=truncate,
+                max_length=512
+            )["input_ids"]
 
         if move_to_device:
             tokens = tokens.to(self.device)
         return tokens
+
+    def render_convo(self, input, prompt):
+        
+        if not self.system_tokens:
+            system_message = (
+                SystemContent.new()
+                    .with_reasoning_effort(ReasoningEffort.LOW)
+                    .with_conversation_start_date("2025-06-28")
+            )
+            system_conv = Conversation.from_messages(
+                [
+                    Message.from_role_and_content(Role.SYSTEM, system_message)
+                ]
+            )
+            self.system_tokens = self.encoding.render_conversation_for_completion(system_conv, Role.USER) + [200008]
+        
+        if not self.think_tokens:
+            think_conv = Conversation.from_messages(
+                [
+                    Message.from_role_and_content(
+                        Role.ASSISTANT,
+                        'Need to do what the user is asking.',
+                    ).with_channel("analysis")
+                ]
+            )
+            self.think_tokens = self.encoding.render_conversation_for_completion(think_conv, Role.ASSISTANT) + [200005,  17196, 200008]
+
+
+        prompt_tokens = self.tokenizer(
+            prompt,
+            padding=False,
+            truncation=True,
+            add_special_tokens=False,
+            max_length=512
+        )["input_ids"]
+
+
+        input_tokens = self.tokenizer(
+            input,
+            padding=True,
+            truncation=True,
+            add_special_tokens=False,
+            max_length=512
+        )["input_ids"]
+
+        return self.system_tokens + prompt_tokens + self.think_tokens + input_tokens
+
+def per_token_cross_entropy(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    num_items_in_batch: Optional[torch.Tensor] = None,
+    ignore_index: int = -100,
+    **kwargs,
+) -> torch.Tensor:
+    loss = torch.nn.functional.cross_entropy(source, target, ignore_index=ignore_index, reduction='none')
+    # if reduction == "sum":
+    #     # just in case users pass an int for num_items_in_batch, which could be the case for custom trainer
+    #     if torch.is_tensor(num_items_in_batch):
+    #         num_items_in_batch = num_items_in_batch.to(loss.device)
+    #     loss = loss / num_items_in_batch
+    return loss
+
+def per_token_loss_fn(
+    logits,
+    labels,
+    vocab_size: int,
+    num_items_in_batch: Optional[torch.Tensor] = None,
+    ignore_index: int = -100,
+    shift_labels: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> torch.Tensor:
+    # Upcast to float if we need to compute the loss to avoid potential precision issues
+    logits = logits.float()
+
+    if shift_labels is None:
+        # Shift so that tokens < n predict n
+        labels = torch.nn.functional.pad(labels, (0, 1), value=ignore_index)
+        shift_labels = labels[..., 1:].contiguous()
+
+    # Flatten the tokens
+    logits = logits.view(-1, vocab_size)
+    shift_labels = shift_labels.view(-1)
+    # Enable model parallelism
+    shift_labels = shift_labels.to(logits.device)
+    loss = per_token_cross_entropy(logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
+    return loss

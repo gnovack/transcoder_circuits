@@ -18,7 +18,7 @@ class ActivationsStore:
     ):
         self.cfg = cfg
         self.model = model
-        self.dataset = load_dataset(cfg.dataset_path, split="train", streaming=True)
+        self.dataset = load_dataset(cfg.dataset_path, 'web_samples_v2', split="train", streaming=True)
         self.iterable_dataset = iter(self.dataset)
         
         # check if it's tokenized
@@ -76,9 +76,11 @@ class ActivationsStore:
         # pbar = tqdm(total=batch_size, desc="Filling batches")
         while batch_tokens.shape[0] < batch_size:
             if not self.cfg.is_dataset_tokenized:
-                s = next(self.iterable_dataset)["text"]
+                next_record = next(self.iterable_dataset)
+                s = next_record["text"]
                 tokens = self.model.to_tokens(
                     s, 
+                    prompt=next_record.get('prompt'),
                     truncate=True, 
                     move_to_device=True,
                     ).squeeze(0)

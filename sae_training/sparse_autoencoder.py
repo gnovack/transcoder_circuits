@@ -149,7 +149,7 @@ class SparseAutoencoder(HookedRootModule):
             mse_loss = (torch.pow((sae_out-mse_target.float()), 2) / (mse_target**2).sum(dim=-1, keepdim=True).sqrt())
         mse_loss_ghost_resid = torch.tensor(0.0, dtype=self.dtype, device=self.device)
         # gate on config and training so evals is not slowed down.
-        if self.cfg.use_ghost_grads and self.training and dead_neuron_mask.sum() > 0:
+        if self.cfg.use_ghost_grads and self.training and dead_neuron_mask is not None and dead_neuron_mask.sum() > 0:
             assert dead_neuron_mask is not None 
             
             # ghost protocol
@@ -480,7 +480,7 @@ class SparseAutoencoder(HookedRootModule):
             ce_loss_with_recons = self.get_test_loss(batch_tokens, model)
             ce_loss_without_recons, normal_activations_cache = model.run_with_cache(
                 batch_tokens,
-                names_filter=self.cfg.hook_point,
+                names_filter=[self.cfg.hook_point],
                 return_type = "loss",
                 loss_per_token = True,
             )
@@ -493,7 +493,7 @@ class SparseAutoencoder(HookedRootModule):
 
             # calculate the difference in loss
             changes_in_loss = ce_loss_with_recons - ce_loss_without_recons
-            changes_in_loss = changes_in_loss.cpu()
+            changes_in_loss = changes_in_loss.reshape(batch_tokens.shape).cpu()
             
             # sample from the loss differences
             probs = F.relu(changes_in_loss) / F.relu(changes_in_loss).sum(dim=1, keepdim=True)
@@ -538,19 +538,31 @@ class SparseAutoencoder(HookedRootModule):
             # TODO: currently, this only works with MLP transcoders
             assert("mlp" in self.cfg.out_hook_point)
             
-            old_mlp = model.blocks[self.cfg.hook_point_layer]
+            # old_mlp = model.blocks[self.cfg.hook_point_layer]
+            
+            layer_idx = int(self.cfg.out_hook_point.split(".")[-1])
+
+            old_mlp = model.model.layers[layer_idx].mlp
             class TranscoderWrapper(torch.nn.Module):
                 def __init__(self, transcoder):
                     super().__init__()
                     self.transcoder = transcoder
                 def forward(self, x):
-                    return self.transcoder(x)[0]
-            model.blocks[self.cfg.hook_point_layer].mlp = TranscoderWrapper(self)
-            ce_loss_with_recons = model.run_with_hooks(
+                    return self.transcoder(x)[0].to(torch.bfloat16), None
+            
+            # model.blocks[self.cfg.hook_point_layer].mlp = TranscoderWrapper(self)
+            model.model.layers[layer_idx].mlp = TranscoderWrapper(self)
+            
+            ce_loss_with_recons = model(
                 batch_tokens,
-                return_type="loss"
-            )
-            model.blocks[self.cfg.hook_point_layer] = old_mlp
+                labels=batch_tokens
+            ).loss
+            # ce_loss_with_recons = model.run_with_hooks(
+            #     batch_tokens,
+            #     return_type="loss"
+            # )
+            # model.blocks[self.cfg.hook_point_layer] = old_mlp
+            model.model.layers[layer_idx].mlp = old_mlp
         
         return ce_loss_with_recons
         
@@ -621,7 +633,7 @@ class SparseAutoencoder(HookedRootModule):
                     state_dict = torch.load(path, map_location="mps")
                     state_dict["cfg"].device = "mps"
                 else:
-                    state_dict = torch.load(path)
+                    state_dict = torch.load(path, weights_only=False)
             except Exception as e:
                 raise IOError(f"Error loading the state dictionary from .pt file: {e}")
             
