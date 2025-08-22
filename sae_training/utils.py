@@ -3,6 +3,7 @@ from typing import Tuple
 import torch
 from transformer_lens import HookedTransformer
 
+from gpt_oss.model import HookedGptOssForCausalLM
 from sae_training.activations_store import ActivationsStore
 from sae_training.config import LanguageModelSAERunnerConfig
 from sae_training.sparse_autoencoder import SparseAutoencoder
@@ -25,7 +26,8 @@ class LMSparseAutoencoderSessionloader():
         Loads a session for training a sparse autoencoder on a language model.
         '''
         
-        model = self.get_model(self.cfg.model_name)
+        # model = self.get_model(self.cfg.model_name)
+        model = self.get_gpt_oss_model(self.cfg.model_name)
         model.to(self.cfg.device)
         activations_loader = self.get_activations_loader(self.cfg, model)
         sparse_autoencoder = self.initialize_sparse_autoencoder(self.cfg)
@@ -58,6 +60,19 @@ class LMSparseAutoencoderSessionloader():
         # Todo: add check that model_name is valid
         
         model = HookedTransformer.from_pretrained(model_name)
+        
+        return model 
+    
+    def get_gpt_oss_model(self, model_name: str):
+        '''
+        Loads a model from transformer lens
+        '''
+        
+        # Todo: add check that model_name is valid
+        
+        model = HookedGptOssForCausalLM.from_pretrained(model_name)
+        model.eval()
+        model.requires_grad_(False)
         
         return model 
     

@@ -24,6 +24,7 @@ from sae_training.train_sae_on_language_model import train_sae_on_language_model
 
 lr = 0.0004 # learning rate
 l1_coeff = 0.00014 # l1 sparsity regularization coefficient
+hook_point_layer = 8
 
 cfg = LanguageModelSAERunnerConfig(
     # Data Generating Function (Model + Training Distibuion)
@@ -34,12 +35,14 @@ cfg = LanguageModelSAERunnerConfig(
     #    pre-MLP LayerNorm -- that is, the inputs to the MLP.
     # You might alternatively prefer to train on "blocks.8.hook_resid_mid",
     #    which corresponds to the input to the pre-MLP LayerNorm.
-    hook_point = "blocks.8.ln2.hook_normalized",
-    hook_point_layer = 8,
-    d_in = 768,
-    dataset_path = "Skylion007/openwebtext",
+    # hook_point = "blocks.8.ln2.hook_normalized",
+    hook_point_layer = hook_point_layer,
+    hook_point = f"mlp_input.{hook_point_layer}",
+    d_in = 2880,
+    # dataset_path = "Skylion007/openwebtext",
+    dataset_path = "HuggingFaceFW/fineweb",
     is_dataset_tokenized=False,
-    model_name='gpt2-small',
+    model_name='openai/gpt-oss-20b',
 
     # Transcoder-specific parameters.
     is_transcoder = True, # We're training a transcoder here.
@@ -52,12 +55,12 @@ cfg = LanguageModelSAERunnerConfig(
     # As such, we want to grab the "hook_mlp_out" activations from our
     #    transformer, which (as the name suggests), represent the
     #    output activations of the original MLP sublayer.
-    out_hook_point = "blocks.8.hook_mlp_out",
-    out_hook_point_layer = 8,
-    d_out = 768,
+    out_hook_point = f"mlp_output.{hook_point_layer}",
+    out_hook_point_layer = hook_point_layer,
+    d_out = 2880,
     
     # SAE Parameters
-    expansion_factor = 32,
+    expansion_factor = 128,
     b_dec_init_method = "mean",
     
     # Training Parameters
@@ -70,7 +73,7 @@ cfg = LanguageModelSAERunnerConfig(
     
     # Activation Store Parameters
     n_batches_in_buffer = 128,
-    total_training_tokens = 1_000_000 * 60,
+    total_training_tokens = 1_000_000 * 300,
     store_batch_size = 32,
     
     # Dead Neurons and Sparsity
@@ -89,11 +92,10 @@ cfg = LanguageModelSAERunnerConfig(
     
     # Misc
     use_tqdm = True,
-    # device = "cuda",
-    device = "mps",
+    device = "cuda:0",
     seed = 42,
-    n_checkpoints = 3,
-    checkpoint_path = "gpt2-small-transcoders", # change as you please
+    n_checkpoints = 20,
+    checkpoint_path = "gpt-oss-20b-transcoders", # change as you please
     dtype = torch.float32,
 )
 
