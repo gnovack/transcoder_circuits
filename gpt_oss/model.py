@@ -1,4 +1,5 @@
-from typing import Optional
+from typing import List, Literal, Optional, Union
+import numpy as np
 import torch
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 from transformers.models.gpt_oss.modeling_gpt_oss import GptOssMLP, GptOssDecoderLayer, GptOssModel, GptOssForCausalLM, GptOssPreTrainedModel, GptOssRMSNorm, GptOssRotaryEmbedding, GptOssAttention, GradientCheckpointingLayer
@@ -155,7 +156,87 @@ class HookedGptOssForCausalLM(GptOssForCausalLM):
         else:
             raise NotImplementedError("Only 'loss' is implemented!")
                        
+    
+    def to_str_tokens(
+        self,
+        input: Union[
+            str,
+            torch.Tensor,
+            np.ndarray,
+            list,
+        ],
+        prepend_bos: Optional[Union[bool, None]] = None,
+        padding_side: Optional[Union[Literal["left", "right"], None]] = None,
+    ) -> Union[List[str], List[List[str]]]:
+        """Map text, a list of text or tokens to a list of tokens as strings.
 
+        Gotcha: prepend_bos prepends a beginning of string token. This is a recommended default when
+        inputting a prompt to the model as the first token is often treated weirdly, but should only
+        be done at the START of the prompt. If prepend_bos=None is passed, it implies the usage of
+        self.cfg.default_prepend_bos which is set to True unless specified otherwise. Therefore,
+        make sure to locally turn it off by passing prepend_bos=False if you're looking at the
+        tokenization of part of the prompt! (Note: some models eg GPT-2 were not trained with a BOS
+        token, others (OPT and my models) were)
+
+        Gotcha2: Tokenization of a string depends on whether there is a preceding space and whether
+        the first letter is capitalized. It's easy to shoot yourself in the foot here if you're not
+        careful!
+
+        Gotcha3: If passing a string that exceeds the model's context length (model.cfg.n_ctx), it
+        will be truncated.
+
+        Args:
+            input (Union[str, list, torch.Tensor]): The input - either a string or a tensor of
+                tokens. If tokens, should be a tensor of shape [pos] or [1, pos].
+            prepend_bos (bool, optional): Overrides self.cfg.default_prepend_bos. Whether to prepend
+                the BOS token to the input (only applies when input is a string). Defaults to None,
+                implying usage of self.cfg.default_prepend_bos which is set to True unless specified
+                otherwise. Pass True or False to locally override the default.
+            padding_side (Union[Literal["left", "right"], None], optional): Overrides
+                self.tokenizer.padding_side. Specifies which side to pad when tokenizing multiple
+                strings of different lengths.
+
+        Returns:
+            str_tokens: List of individual tokens as strings
+        """
+        assert self.tokenizer is not None  # keep mypy happy
+        tokens: Union[np.ndarray, torch.Tensor]
+        if isinstance(input, list):
+            return list(
+                map(
+                    lambda tokens: self.to_str_tokens(tokens, prepend_bos, padding_side),
+                    input,
+                )
+            )  # type: ignore
+        elif isinstance(input, str):
+            tokens = self.to_tokens(input, prepend_bos=prepend_bos, padding_side=padding_side)[
+                0
+            ]
+            # Gemma tokenizer expects a batch dimension
+            if "gemma" in self.tokenizer.name_or_path and tokens.ndim == 1:
+                tokens = tokens.unsqueeze(1)
+        elif isinstance(input, torch.Tensor):
+            tokens = input
+            tokens = tokens.squeeze()  # Get rid of a trivial batch dimension
+            if tokens.dim() == 0:
+                # Don't pass dimensionless tensor
+                tokens = tokens.unsqueeze(0)
+            assert (
+                tokens.dim() == 1
+            ), f"Invalid tokens input to to_str_tokens, has shape: {tokens.shape}"
+        elif isinstance(input, np.ndarray):
+            tokens = input
+            tokens = tokens.squeeze()  # Get rid of a trivial batch dimension
+            if tokens.ndim == 0:
+                # Don't pass dimensionless tensor
+                tokens = np.expand_dims(tokens, axis=0)
+            assert (
+                tokens.ndim == 1
+            ), f"Invalid tokens input to to_str_tokens, has shape: {tokens.shape}"
+        else:
+            raise ValueError(f"Invalid input type to to_str_tokens: {type(input)}")
+        str_tokens = self.tokenizer.batch_decode(tokens, clean_up_tokenization_spaces=False)
+        return str_tokens
     
     def to_tokens(self, input, prompt=None, truncate=True, move_to_device=True):
 
@@ -267,3 +348,4 @@ def per_token_loss_fn(
     shift_labels = shift_labels.to(logits.device)
     loss = per_token_cross_entropy(logits, shift_labels, num_items_in_batch, ignore_index, **kwargs)
     return loss
+
