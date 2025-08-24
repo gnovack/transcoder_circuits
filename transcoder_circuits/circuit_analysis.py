@@ -11,19 +11,22 @@ from transformer_lens.utils import get_act_name, to_numpy
 
 @torch.no_grad()
 def get_attn_head_contribs(model, cache, layer, range_normal):
-	split_vals = cache[get_act_name('v', layer)]
-	attn_pattern = cache[get_act_name('pattern', layer)]
+	# split_vals = cache[get_act_name('v', layer)]
+	split_vals = cache[f'value.{layer}']
+	# attn_pattern = cache[get_act_name('pattern', layer)]
+	attn_pattern = cache[f"attn_pattern.{layer}"]
 	#'batch head dst src, batch src head d_head -> batch head dst src d_head'
 	weighted_vals = torch.einsum(
 		'b h d s, b s h f -> b h d s f',
-		attn_pattern, split_vals
+		attn_pattern, split_vals.transpose(1,2)
 	)
 
   # 'batch head dst src d_head, head d_head d_model -> batch head dst src d_model'
 	weighted_outs = torch.einsum(
 		'b h d s f, h f m -> b h d s m',
-		weighted_vals, model.W_O[layer]
-	)
+		# weighted_vals, model.W_O[layer]
+		weighted_vals, model.model.layers[layer].self_attn.o_proj.weight.transpose(1,0).reshape(64, -1, 2880)
+	).to(torch.float32)
 
   # 'batch head dst src d_model, d_model -> batch head dst src'
 	contribs = torch.einsum(
@@ -37,9 +40,11 @@ def get_attn_head_contribs(model, cache, layer, range_normal):
 def get_transcoder_ixg(transcoder, cache, range_normal, input_layer, input_token_idx, return_numpy=True, is_transcoder_post_ln=True, return_feature_activs=True):
     pulledback_feature = transcoder.W_dec @ range_normal
     if is_transcoder_post_ln:
-        act_name = get_act_name('normalized', input_layer, 'ln2')
+        # act_name = get_act_name('normalized', input_layer, 'ln2')
+        act_name = f"mlp_input.{input_layer}"
     else:
-        act_name = get_act_name('resid_mid', input_layer)
+        act_name = f"mlp_input_pre_norm.{input_layer}"
+        # act_name = get_act_name('resid_mid', input_layer)
 
     feature_activs = transcoder(cache[act_name])[1][0,input_token_idx]
     pulledback_feature = pulledback_feature * feature_activs
@@ -77,7 +82,7 @@ def get_mean_ixg(model, tokens_arr, range_transcoder, range_feature_idx, transco
         if token_idxs is not None:
             example_idx, token_idx = t
             with torch.no_grad():
-                _, cache = model.run_with_cache(tokens_arr[example_idx, :token_idx+1], stop_at_layer=layer+1, names_filter=[
+                _, cache = model.run_with_cache(tokens_arr[example_idx:example_idx+1, :token_idx+1], stop_at_layer=layer+1, names_filter=[
                     act_name
                 ])
                 acts = cache[act_name]
@@ -111,11 +116,13 @@ def get_mean_ixg(model, tokens_arr, range_transcoder, range_feature_idx, transco
 #	https://www.neelnanda.io/mechanistic-interpretability/attribution-patching
 @torch.no_grad()
 def get_ln_constant(model, cache, vector, layer, token, is_ln2=False, recip=False):
-    x_act_name = get_act_name('resid_mid', layer) if is_ln2 else get_act_name('resid_pre', layer)
-    x = cache[x_act_name][0, token]
+    # x_act_name = get_act_name('resid_mid', layer) if is_ln2 else get_act_name('resid_pre', layer)
+    x_act_name = f"mlp_input_pre_norm.{layer}"
+    x = cache[x_act_name][0, token].to(torch.float32)
 
-    y_act_name = get_act_name('normalized', layer, 'ln2' if is_ln2 else 'ln1')
-    y = cache[y_act_name][0, token]
+    # y_act_name = get_act_name('normalized', layer, 'ln2' if is_ln2 else 'ln1')
+    y_act_name = f"mlp_input.{layer}"
+    y = cache[y_act_name][0, token].to(torch.float32)
 
     if torch.dot(vector, x) == 0:
         return torch.tensor(0.)
@@ -237,7 +244,7 @@ def make_sae_feature_vector(sae, feature_idx, use_encoder=True, token=-1):
     vector = torch.clone(vector.detach())
     vector.requires_grad = False
     vector.requires_grad_(False)
-    if 'resid_mid' in hook_point or ('normalized' in hook_point and 'ln2' in hook_point):
+    if 'mlp_input' in hook_point or 'resid_mid' in hook_point or ('normalized' in hook_point and 'ln2' in hook_point):
         # currently, we treat ln2normalized as resid_mid
         # this is kinda ugly, but because we account for layernorm constants in later
         #  functions, this does work now
@@ -272,15 +279,18 @@ def make_sae_feature_vector(sae, feature_idx, use_encoder=True, token=-1):
 @torch.no_grad()
 def get_top_transcoder_features(model, transcoder, cache, feature_vector, layer, k=5):
     my_token = feature_vector.token if feature_vector.token >= 0 else cache[get_act_name('resid_pre', 0)].shape[1]+feature_vector.token
-    is_transcoder_post_ln = 'ln2' in transcoder.cfg.hook_point and 'normalized' in transcoder.cfg.hook_point
+    is_transcoder_post_ln = 'mlp_input' in transcoder.cfg.hook_point
+    # is_transcoder_post_ln = 'ln2' in transcoder.cfg.hook_point and 'normalized' in transcoder.cfg.hook_point
     
     # compute error
     if is_transcoder_post_ln:
-        act_name = get_act_name('normalized', layer, 'ln2')
+        # act_name = get_act_name('normalized', layer, 'ln2')
+        act_name = f"mlp_input.{layer}"
     else:
         act_name = get_act_name('resid_mid', layer)
     transcoder_out = transcoder(cache[act_name])[0][0,my_token]
-    mlp_out = model.blocks[layer].mlp(cache[act_name])[0, my_token]
+    mlp_out = model.model.layers[layer].mlp(cache[act_name])[0][0, my_token]
+    mlp_out = mlp_out.to(torch.float)
     error = torch.dot(feature_vector.vector, mlp_out - transcoder_out)/torch.dot(feature_vector.vector, mlp_out)
 
     # compute pulledback feature
@@ -340,8 +350,10 @@ def get_top_contribs(model, transcoders, cache, feature_vector, k=5, ignore_bos=
         for contrib, (head, src_token) in zip(top_attn_contribs_flattened, top_attn_contrib_indices):
             if ignore_bos:
                 src_token = src_token + 1
-            vector = model.OV[cur_layer, head] @ feature_vector.vector
-            attn_pattern = cache[get_act_name('pattern', cur_layer)]
+            vector = model.model.layers[cur_layer].OV(head).to(torch.float32) @ feature_vector.vector
+            # vector = model.OV[cur_layer, head] @ feature_vector.vector
+            # attn_pattern = cache[get_act_name('pattern', cur_layer)]
+            attn_pattern = cache[f"attn_pattern.{cur_layer}"]
             vector = vector * attn_pattern[0, head, feature_vector.token, src_token]
             ln_constant = get_ln_constant(model, cache, vector, cur_layer, src_token, is_ln2=False)
             vector = vector * ln_constant
@@ -364,7 +376,8 @@ def get_top_contribs(model, transcoders, cache, feature_vector, k=5, ignore_bos=
             all_attn_contribs.append(new_feature_vector)
 
     # get embedding contribs
-    my_token = feature_vector.token if feature_vector.token >= 0 else cache[get_act_name('resid_pre', 0)].shape[1]+feature_vector.token
+    # my_token = feature_vector.token if feature_vector.token >= 0 else cache[get_act_name('resid_pre', 0)].shape[1]+feature_vector.token
+    my_token = feature_vector.token if feature_vector.token >= 0 else cache[f'residual.{0}'].shape[1]+feature_vector.token
     embedding_contrib = FeatureVector(
         component_path = feature_vector.component_path + [Component(
             layer=0,
@@ -374,7 +387,8 @@ def get_top_contribs(model, transcoders, cache, feature_vector, k=5, ignore_bos=
         vector=feature_vector.vector,
         layer=0,
         sublayer='resid_pre',
-        contrib=torch.dot(cache[get_act_name('resid_pre', 0)][0, feature_vector.token], feature_vector.vector).item(),
+        # contrib=torch.dot(cache[get_act_name('resid_pre', 0)][0, feature_vector.token], feature_vector.vector).item(),
+        contrib=torch.dot(cache[f'residual.{0}'][0, feature_vector.token].to(torch.float32), feature_vector.vector).item(),
         contrib_type=ContribType.RAW
     )
 

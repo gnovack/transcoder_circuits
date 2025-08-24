@@ -311,10 +311,14 @@ def plot_pulledback_feature(model, feature_vector, transcoder, size=None, do_plo
             elif type(input_example) is str:
                 prompt = input_example
             # TODO: add list support
-            _, cache = model.run_with_cache(prompt, stop_at_layer=input_layer+1,
-                names_filter=get_act_name(f'normalized{input_layer}ln2', input_layer)
+            _, cache = model.run_with_cache(prompt.unsqueeze(0), stop_at_layer=input_layer+1,
+                names_filter=[f"mlp_input.{input_layer}"]
             )
-            feature_activs = transcoder(cache[get_act_name(f'normalized{input_layer}ln2', input_layer)])[1][0,input_token_idx]
+            # _, cache = model.run_with_cache(prompt, stop_at_layer=input_layer+1,
+            #     names_filter=get_act_name(f'normalized{input_layer}ln2', input_layer)
+            # )
+            # feature_activs = transcoder(cache[get_act_name(f'normalized{input_layer}ln2', input_layer)])[1][0,input_token_idx]
+            feature_activs = transcoder(cache[f"mlp_input.{input_layer}"])[1][0,input_token_idx]
             pulledback_feature = pulledback_feature * feature_activs
             
     pulledback_feature = to_numpy(pulledback_feature)

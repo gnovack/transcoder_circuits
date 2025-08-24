@@ -2,7 +2,7 @@ from typing import List, Literal, Optional, Union
 import numpy as np
 import torch
 from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
-from transformers.models.gpt_oss.modeling_gpt_oss import GptOssMLP, GptOssDecoderLayer, GptOssModel, GptOssForCausalLM, GptOssPreTrainedModel, GptOssRMSNorm, GptOssRotaryEmbedding, GptOssAttention, GradientCheckpointingLayer
+from transformers.models.gpt_oss.modeling_gpt_oss import GptOssMLP, GptOssDecoderLayer, GptOssModel, GptOssForCausalLM, GptOssPreTrainedModel, GptOssRMSNorm, GptOssRotaryEmbedding, GptOssAttention, GradientCheckpointingLayer, repeat_kv
 from transformers.cache_utils import Cache
 from transformers import AutoTokenizer, PreTrainedTokenizer
 from transformers.integrations.mxfp4 import mlp_forward
@@ -30,9 +30,6 @@ class HookedGptOssMlp(GptOssMLP):
         self.replacement_hook = None
     
     def forward(self, hidden_states):
-        # router_scores, router_indices = self.router(hidden_states)  # (num_experts, seq_len)
-        # routed_out = self.experts(hidden_states, router_indices=router_indices, routing_weights=router_scores)
-        # result = super().forward(hidden_states)
 
         if self.replacement_hook:
             result = self.replacement_hook(hidden_states)
@@ -40,10 +37,8 @@ class HookedGptOssMlp(GptOssMLP):
             result, router_logits = mlp_forward(self, hidden_states)
 
         if self.cache:
-            self.act_cache = {
-                f'mlp_input.{self.layer_idx}': hidden_states,
-                f'mlp_output.{self.layer_idx}': result,
-            }
+            self.act_cache[f'mlp_input.{self.layer_idx}'] = hidden_states
+            self.act_cache[f'mlp_output.{self.layer_idx}'] = result
         return result, None
 
 class HookedGptOssDecoderLayer(GptOssDecoderLayer):
@@ -55,10 +50,67 @@ class HookedGptOssDecoderLayer(GptOssDecoderLayer):
         self.input_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_type = config.layer_types[layer_idx]
+        self.layer_idx = layer_idx
+
+    def OV(self, head):
         
-        # super().__init__(config, layer_idx)
-        # del self.mlp
-        # self.mlp = HookedGptOssMlp(config, layer_idx)
+        start = head*self.self_attn.head_dim
+        end = start+self.self_attn.head_dim
+        
+        v = self.self_attn.v_proj.weight[:,None,:].expand(512,self.self_attn.num_key_value_groups,2880).reshape(4096,2880)
+        o = self.self_attn.o_proj.weight
+        
+        return torch.matmul(
+            v[start:end,:].transpose(0,1), o[:,start:end].transpose(0,1)
+        )
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        use_cache: Optional[bool] = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        **kwargs,
+    ) -> tuple[torch.Tensor]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        
+        if self.mlp.cache:
+            input_shape = hidden_states.shape[:-1]
+            hidden_shape = (*input_shape, -1, self.self_attn.head_dim)
+            value_states = self.self_attn.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = repeat_kv(value_states, self.self_attn.num_key_value_groups)
+            self.mlp.act_cache[f'value.{self.layer_idx}'] = value_states
+
+            self.mlp.act_cache[f'residual.{self.layer_idx}'] = residual
+        
+        # Self Attention
+        hidden_states, attn_weights = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            position_embeddings=position_embeddings,
+            **kwargs,
+        )
+        hidden_states = residual + hidden_states
+
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+
+        if self.mlp.cache:
+            self.mlp.act_cache[f'attn_pattern.{self.layer_idx}'] = attn_weights
+            self.mlp.act_cache[f'mlp_input_pre_norm.{self.layer_idx}'] = hidden_states
+
+        hidden_states, _ = self.mlp(hidden_states)  # diff with llama: router scores
+        hidden_states = residual + hidden_states
+        return hidden_states
 
 class HookedGptOssModel(GptOssModel):
 
@@ -120,6 +172,10 @@ class HookedGptOssForCausalLM(GptOssForCausalLM):
         if names_filter:
             layer_idx = int(names_filter[0].split('.')[-1])
             self.model.enable_cache(layer_idx)
+        else:
+            for i in range(len(self.model.layers)):
+                self.model.enable_cache(i)
+
 
         if return_type == 'loss':
             output = self.forward(input_ids, labels=input_ids, names_filter=names_filter, stop_at_layer=stop_at_layer)
@@ -138,6 +194,10 @@ class HookedGptOssForCausalLM(GptOssForCausalLM):
             caches = self.model.pop_caches()
             layer_idx = int(names_filter[0].split('.')[-1])
             self.model.disable_cache(layer_idx)
+        else:
+            caches = self.model.pop_caches()
+            for i in range(len(self.model.layers)):
+                self.model.disable_cache(i)
         return output, caches
 
     def run_with_hooks(self, input_ids, return_type, fwd_hooks):
@@ -209,7 +269,7 @@ class HookedGptOssForCausalLM(GptOssForCausalLM):
                 )
             )  # type: ignore
         elif isinstance(input, str):
-            tokens = self.to_tokens(input, prepend_bos=prepend_bos, padding_side=padding_side)[
+            tokens = self.to_tokens(input)[
                 0
             ]
             # Gemma tokenizer expects a batch dimension
